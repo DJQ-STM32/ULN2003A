@@ -1,0 +1,22 @@
+# STM32CubeIDE 构建输出
+Debug/
+Release/
+build/
+
+# 编译中间产物
+*.o
+*.d
+*.elf
+*.axf
+*.map
+*.lst
+*.hex
+*.bin
+*.su
+*.crf
+*.lnp
+*.depend
+
+# 其他杂项
+*.log
+*.bak
