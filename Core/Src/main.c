@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -31,6 +32,7 @@
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
+typedef StaticTask_t osStaticThreadDef_t;
 /* USER CODE BEGIN PTD */
 
 /* USER CODE END PTD */
@@ -60,57 +62,54 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-/* 运行标志: 1 = 运行, 0 = 暂停. 全局, 主循环和电机延时都要用 */
+/* 运行标志: 1 = 正在跑, 0 = 已停在原点. 全局, 主循环和电机延时都要用 */
 volatile uint8_t g_run_flag = 0;
 
-/* 记录当前正在通电的相, 暂停/恢复时要重新打开它 */
-static uint16_t g_current_phase = 0;
+/* 停机请求: 1 = 按过按钮了, 这一轮跑完再停.
+ *
+ * 转动途中按下不立刻停机, 只把这里置 1; 等 main 里一轮 (逆180 + 顺180)
+ * 走完、电机正好回到最原始的位置, 才真正断相停下。
+ * 所以整轮期间只置位、不清零, 动作永远落在原点上。 */
+volatile uint8_t g_stop_req = 0;
 
-/* 暂停: 断掉所有相, 死等按键恢复, 恢复后把当前相重新打开 */
-static void Motor_WaitResume(void)
+/* 断掉全部四相. 停机时用, 防电机堵转发热
+ * (本轮最后停在 A|B 相, 正好是起始那一相, 也就是一个整步定位点,
+ *  断电后转子不会偏, 原位就是这里) */
+static void Motor_AllOff(void)
 {
-	HAL_GPIO_WritePin(MOTOR_PORT, MOTOR_ALL_PINS, GPIO_PIN_RESET);   /* 断电, 防发热 */
+	HAL_GPIO_WritePin(MOTOR_PORT, MOTOR_ALL_PINS, GPIO_PIN_RESET);
+}
 
-	while (g_run_flag == 0)
+/* 等按键松手.
+ * 停机那一刻如果手还按着, 主循环的 Key_GetNum() 会立刻把这次按键当成
+ * "再按一次启动", 电机刚停就又转起来。所以停机后先把这次按键放干净,
+ * 这样必须重新按一次才会再次启动。 */
+static void Key_WaitRelease(void)
+{
+	while (Key_Read() != 0)
 	{
-		if (Key_GetNum() == 1)
-		{
-			g_run_flag = 1;
-		}
-		HAL_Delay(1);
+		HAL_Delay(10);
 	}
-
-	/* 恢复: 重新打开暂停前的那一相 */
-	HAL_GPIO_WritePin(MOTOR_PORT, g_current_phase, GPIO_PIN_SET);
-	HAL_GPIO_WritePin(MOTOR_PORT,
-	                  (uint16_t)(MOTOR_ALL_PINS & ~g_current_phase),
-	                  GPIO_PIN_RESET);
 }
 
 /* 把指定的相置高, 其余三相全部关断, 然后延时.
- * 延时被切成 1ms 一小段, 每段检测一次按键, 这样转动途中也能暂停/恢复 */
+ * 延时被切成 1ms 一小段, 每段采一次按键 —— 但只做标记, 不停。
+ *
+ * 这里必须用不打消抖的 Key_Read(), 不能用 Key_GetNum():
+ * Key_GetNum() 里有 20ms 消抖 + 空等松手, 而这里的步进节拍只有 2ms,
+ * 拿它轮询会把节拍整个卡住, 电机一顿一顿的。
+ * 人手按一下至少几十毫秒, 1ms 采一次不会漏; 万一采到毛刺, 也只是提前
+ * 一轮停, 不会乱动作。 */
 static void Motor_Phase(uint16_t set_pins, uint16_t speed)
 {
-	g_current_phase = set_pins;
-
-	/* 如果进来时就已经是暂停状态, 先等 */
-	if (g_run_flag == 0)
-	{
-		Motor_WaitResume();
-	}
-
 	HAL_GPIO_WritePin(MOTOR_PORT, set_pins, GPIO_PIN_SET);
 	HAL_GPIO_WritePin(MOTOR_PORT, (uint16_t)(MOTOR_ALL_PINS & ~set_pins), GPIO_PIN_RESET);
 
 	while (speed > 0)
 	{
-		if (Key_GetNum() == 1)          /* 转动途中按下 -> 翻转状态 */
+		if (g_stop_req == 0 && Key_Read() != 0)   /* 转动途中按下 -> 只记请求 */
 		{
-			g_run_flag = !g_run_flag;
-			if (g_run_flag == 0)
-			{
-				Motor_WaitResume();     /* 暂停并等待恢复 */
-			}
+			g_stop_req = 1;
 		}
 		HAL_Delay(1);
 		speed--;
@@ -181,6 +180,61 @@ I2C_HandleTypeDef hi2c1;
 
 TIM_HandleTypeDef htim2;
 
+/* Definitions for defaultTask */
+osThreadId_t defaultTaskHandle;
+const osThreadAttr_t defaultTask_attributes = {
+  .name = "defaultTask",
+  .stack_size = 128 * 4,
+  .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for LihgtSenorTask */
+osThreadId_t LihgtSenorTaskHandle;
+uint32_t LihgtSenorTaskBuffer[ 128 ];
+osStaticThreadDef_t LihgtSenorTaskControlBlock;
+const osThreadAttr_t LihgtSenorTask_attributes = {
+  .name = "LihgtSenorTask",
+  .cb_mem = &LihgtSenorTaskControlBlock,
+  .cb_size = sizeof(LihgtSenorTaskControlBlock),
+  .stack_mem = &LihgtSenorTaskBuffer[0],
+  .stack_size = sizeof(LihgtSenorTaskBuffer),
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for RainSenorTask */
+osThreadId_t RainSenorTaskHandle;
+uint32_t RainSenorTaskBuffer[ 128 ];
+osStaticThreadDef_t RainSenorTaskControlBlock;
+const osThreadAttr_t RainSenorTask_attributes = {
+  .name = "RainSenorTask",
+  .cb_mem = &RainSenorTaskControlBlock,
+  .cb_size = sizeof(RainSenorTaskControlBlock),
+  .stack_mem = &RainSenorTaskBuffer[0],
+  .stack_size = sizeof(RainSenorTaskBuffer),
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for MotorTask */
+osThreadId_t MotorTaskHandle;
+uint32_t MotorTaskBuffer[ 128 ];
+osStaticThreadDef_t MotorTaskControlBlock;
+const osThreadAttr_t MotorTask_attributes = {
+  .name = "MotorTask",
+  .cb_mem = &MotorTaskControlBlock,
+  .cb_size = sizeof(MotorTaskControlBlock),
+  .stack_mem = &MotorTaskBuffer[0],
+  .stack_size = sizeof(MotorTaskBuffer),
+  .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for LCDTask */
+osThreadId_t LCDTaskHandle;
+uint32_t LCDTaskBuffer[ 128 ];
+osStaticThreadDef_t LCDTaskControlBlock;
+const osThreadAttr_t LCDTask_attributes = {
+  .name = "LCDTask",
+  .cb_mem = &LCDTaskControlBlock,
+  .cb_size = sizeof(LCDTaskControlBlock),
+  .stack_mem = &LCDTaskBuffer[0],
+  .stack_size = sizeof(LCDTaskBuffer),
+  .priority = (osPriority_t) osPriorityLow,
+};
 /* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
@@ -190,6 +244,12 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM2_Init(void);
+void StartDefaultTask(void *argument);
+void LihgtSenor_Task(void *argument);
+void RainSenor_Task(void *argument);
+void Motor_Task(void *argument);
+void LCD_Task(void *argument);
+
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -197,6 +257,48 @@ static void MX_TIM2_Init(void);
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
+/* ---------- 一轮: 逆时针 180, 再顺时针 180 ----------
+ * 两次步数一样, 方向相反, 所以一轮跑完净位移为 0,
+ * 电机必定回到出发的那一相, 也就是最原始的位置。
+ * 4*64 = 256 次调用 = 180 度。 */
+void High_MotorSpeed()
+{
+	for (uint32_t i = 0; i < 2*64; i++)
+	{
+	  Motor_two1(1);      /* 逆时针 180 */
+	}
+	for (uint32_t i = 0; i < 2*64; i++)
+	{
+	  Motor_two2(1);      /* 顺时针 180 */
+	}
+
+}
+
+void Middle_MotorSpeed()
+{
+	for (uint32_t i = 0; i < 2*64; i++)
+	{
+	  Motor_two1(3);      /* 逆时针 180 */
+	}
+	for (uint32_t i = 0; i < 2*64; i++)
+	{
+	  Motor_two2(3);      /* 顺时针 180 */
+	}
+
+}
+
+void Low_MotorSpeed()
+{
+	for (uint32_t i = 0; i < 2*64; i++)
+	{
+	  Motor_two1(5);      /* 逆时针 180 */
+	}
+	for (uint32_t i = 0; i < 2*64; i++)
+	{
+	  Motor_two2(5);      /* 顺时针 180 */
+	}
+
+}
 
 /* USER CODE END 0 */
 
@@ -232,31 +334,71 @@ int main(void)
   MX_I2C1_Init();
   MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
-  uint8_t KeyNum = 0;
+  uint8_t S_len = 0;
+  uint8_t K_len = 0;
 
   Key_Init();
+  LCD_Init();
+  LCD_Clear();
+
+  LCD_PrintString(0, 0, "State: ");
+  LCD_PrintString(0, 2, "Key: ");
   /* USER CODE END 2 */
+
+  /* Init scheduler */
+  osKernelInitialize();
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+
+  /* Create the thread(s) */
+  /* creation of defaultTask */
+  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+
+  /* creation of LihgtSenorTask */
+  LihgtSenorTaskHandle = osThreadNew(LihgtSenor_Task, NULL, &LihgtSenorTask_attributes);
+
+  /* creation of RainSenorTask */
+  RainSenorTaskHandle = osThreadNew(RainSenor_Task, NULL, &RainSenorTask_attributes);
+
+  /* creation of MotorTask */
+  MotorTaskHandle = osThreadNew(Motor_Task, NULL, &MotorTask_attributes);
+
+  /* creation of LCDTask */
+  LCDTaskHandle = osThreadNew(LCD_Task, NULL, &LCDTask_attributes);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_EVENTS */
+  /* add events, ... */
+  /* USER CODE END RTOS_EVENTS */
+
+  /* Start scheduler */
+  osKernelStart();
+
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  KeyNum = Key_GetNum();
-	  if (KeyNum == 1)
-	  {
-		  g_run_flag = !g_run_flag;
-	  }
-	  if (g_run_flag == 1)
-	  {
-		  for (uint32_t i = 0; i <= 4*64; i++)
-		  {
-			  Motor_one1(2);      /* 连续转动, 512 次调用 = 一整圈 */
-		  }
-		  for (uint32_t i = 0; i <= 4*64; i++)
-		  {
-			  Motor_one2(2);      /* 连续转动, 512 次调用 = 一整圈 */
-		  }
-	  }
+
+  }
 
     /* USER CODE END WHILE */
 
@@ -457,6 +599,153 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /* USER CODE END 4 */
+
+/* USER CODE BEGIN Header_StartDefaultTask */
+/**
+  * @brief  Function implementing the defaultTask thread.
+  * @param  argument: Not used
+  * @retval None
+  */
+/* USER CODE END Header_StartDefaultTask */
+void StartDefaultTask(void *argument)
+{
+  /* USER CODE BEGIN 5 */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_LihgtSenor_Task */
+/**
+* @brief Function implementing the LihgtSenorTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_LihgtSenor_Task */
+void LihgtSenor_Task(void *argument)
+{
+  /* USER CODE BEGIN LihgtSenor_Task */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END LihgtSenor_Task */
+}
+
+/* USER CODE BEGIN Header_RainSenor_Task */
+/**
+* @brief Function implementing the RainSenorTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_RainSenor_Task */
+void RainSenor_Task(void *argument)
+{
+  /* USER CODE BEGIN RainSenor_Task */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END RainSenor_Task */
+}
+
+/* USER CODE BEGIN Header_Motor_Task */
+/**
+* @brief Function implementing the MotorTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_Motor_Task */
+void Motor_Task(void *argument)
+{
+  /* USER CODE BEGIN Motor_Task */
+  /* Infinite loop */
+  for(;;)
+  {
+	  if (g_run_flag == 1)
+	 	  {
+
+	 		  LCD_PrintStringClean(7, 0, "Start", &S_len);
+	 		  LCD_PrintStringClean(5, 2, "ON", &K_len);
+
+	 		  High_MotorSpeed();
+	 		  Middle_MotorSpeed();
+	 		  Low_MotorSpeed();
+
+	 		  /* 一轮走完, 人已经在原点上, 这时候才处理停机请求 */
+	 		  if (g_stop_req == 1)
+	 		  {
+	 			  LCD_PrintStringClean(7, 0, "Stop", &S_len);
+	 			  LCD_PrintStringClean(5, 2, "OFF", &K_len);
+	 			  Motor_AllOff();
+	 			  g_run_flag = 0;
+	 			  g_stop_req = 0;
+	 			  Key_WaitRelease();   /* 把停机那次按键放干净, 免得它被当成启动 */
+	 		  }
+	 	  }
+	 	  else
+	 	  {
+	 		  LCD_PrintStringClean(7, 0, "Stop", &S_len);
+	 		  LCD_PrintStringClean(5, 2, "OFF", &K_len);
+
+	 		  /* 停着的时候用 Key_GetNum(): 这里有 20ms 消抖并等松手,
+	 		   * 一个干净的"按一下"才会启动, 不会因为抖动反复启停 */
+	 		  if (Key_GetNum() == 1)
+	 		  {
+	 			  g_run_flag = 1;
+	 		  }
+	 	  }
+    osDelay(1);
+  }
+  /* USER CODE END Motor_Task */
+}
+
+/* USER CODE BEGIN Header_LCD_Task */
+/**
+* @brief Function implementing the LCDTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_LCD_Task */
+void LCD_Task(void *argument)
+{
+  /* USER CODE BEGIN LCD_Task */
+	LCD_Init();
+	LCD_Clear();
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END LCD_Task */
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM1 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM1)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.
