@@ -28,12 +28,17 @@
 #include "driver_key.h"
 #include "driver_led.h"
 #include "driver_lcd.h"
-
+#include "driver_light_sensor.h"
+#include "FreeRTOS.h"
+#include "queue.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 typedef StaticTask_t osStaticThreadDef_t;
 /* USER CODE BEGIN PTD */
+typedef struct {
+	uint32_t Data;
+}LightSensor_Data_t;
 
 /* USER CODE END PTD */
 
@@ -176,6 +181,9 @@ void Motor_one_two2(uint16_t speed)	//1-2相励磁(半步) A-AB-B-BC-C-CD-D-DA
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+DMA_HandleTypeDef hdma_adc1;
+
 I2C_HandleTypeDef hi2c1;
 
 TIM_HandleTypeDef htim2;
@@ -236,14 +244,20 @@ const osThreadAttr_t LCDTask_attributes = {
   .priority = (osPriority_t) osPriorityLow,
 };
 /* USER CODE BEGIN PV */
+/* 光敏值广播队列。
+ * 生产端只有光敏任务, 消费端各一个: 电机任务拿去定转速, LCD 任务拿去显示。 */
+QueueHandle_t Queue_Motor;
+QueueHandle_t Queue_LCD;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_TIM2_Init(void);
+static void MX_ADC1_Init(void);
 void StartDefaultTask(void *argument);
 void LihgtSenor_Task(void *argument);
 void RainSenor_Task(void *argument);
@@ -331,11 +345,11 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_I2C1_Init();
   MX_TIM2_Init();
+  MX_ADC1_Init();
   /* USER CODE BEGIN 2 */
-  uint8_t S_len = 0;
-  uint8_t K_len = 0;
 
   Key_Init();
   LCD_Init();
@@ -362,6 +376,8 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
+  Queue_Motor = xQueueCreate(4, sizeof(LightSensor_Data_t));
+  Queue_LCD   = xQueueCreate(4, sizeof(LightSensor_Data_t));
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
@@ -415,6 +431,7 @@ void SystemClock_Config(void)
 {
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
 
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
@@ -444,6 +461,59 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+}
+
+/**
+  * @brief ADC1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_ADC1_Init(void)
+{
+
+  /* USER CODE BEGIN ADC1_Init 0 */
+
+  /* USER CODE END ADC1_Init 0 */
+
+  ADC_ChannelConfTypeDef sConfig = {0};
+
+  /* USER CODE BEGIN ADC1_Init 1 */
+
+  /* USER CODE END ADC1_Init 1 */
+
+  /** Common config
+  */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  /** Configure Regular Channel
+  */
+  sConfig.Channel = ADC_CHANNEL_3;
+  sConfig.Rank = ADC_REGULAR_RANK_1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN ADC1_Init 2 */
+
+  /* USER CODE END ADC1_Init 2 */
+
 }
 
 /**
@@ -540,6 +610,22 @@ static void MX_TIM2_Init(void)
 }
 
 /**
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void)
+{
+
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA1_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA1_Channel1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Channel1_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -560,25 +646,12 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
 
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4
-                          |GPIO_PIN_5|GPIO_PIN_6, GPIO_PIN_RESET);
-
   /*Configure GPIO pin : PC13 */
   GPIO_InitStruct.Pin = GPIO_PIN_13;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : PA1 PA2 PA3 PA4
-                           PA5 PA6 */
-  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4
-                          |GPIO_PIN_5|GPIO_PIN_6;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -628,10 +701,26 @@ void StartDefaultTask(void *argument)
 void LihgtSenor_Task(void *argument)
 {
   /* USER CODE BEGIN LihgtSenor_Task */
-  /* Infinite loop */
+  LightSensor_Data_t data;
+  uint32_t val;
+
+  LightSensor_Init();          /* ADC 校准, 只做一次 */
+
   for(;;)
   {
-    osDelay(1);
+    if (LightSensor_Read(&val) == 0)     /* 返回 0 = 成功 */
+    {
+      data.Data = val;
+
+      /* 同一份数据发给两个消费者: 电机任务拿去定转速, LCD 任务拿去显示。
+       * 超时给 0 (完全不等待): 采光是周期性的, 消费端慢了就把这一帧丢掉,
+       * 绝不能在这里阻塞 —— 只要有一个消费者卡住, 阻塞就会把采光整个拖死。
+       * 丢帧在这里是安全的: 光敏值本来就有噪声, 而且 100ms 后就是新的一帧。 */
+      xQueueSend(Queue_Motor, &data, 0);
+      xQueueSend(Queue_LCD,   &data, 0);
+    }
+
+    osDelay(100);              /* 100ms 采一帧, 10Hz 足够看清光照变化 */
   }
   /* USER CODE END LihgtSenor_Task */
 }
@@ -715,6 +804,9 @@ void Motor_Task(void *argument)
 void LCD_Task(void *argument)
 {
   /* USER CODE BEGIN LCD_Task */
+	uint8_t S_len = 0;
+	uint8_t K_len = 0;
+
 	LCD_Init();
 	LCD_Clear();
   /* Infinite loop */
@@ -727,7 +819,7 @@ void LCD_Task(void *argument)
 
 /**
   * @brief  Period elapsed callback in non blocking mode
-  * @note   This function is called  when TIM1 interrupt took place, inside
+  * @note   This function is called  when TIM3 interrupt took place, inside
   * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
   * a global variable "uwTick" used as application time base.
   * @param  htim : TIM handle
@@ -738,7 +830,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   /* USER CODE BEGIN Callback 0 */
 
   /* USER CODE END Callback 0 */
-  if (htim->Instance == TIM1)
+  if (htim->Instance == TIM3)
   {
     HAL_IncTick();
   }
